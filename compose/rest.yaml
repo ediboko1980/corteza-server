@@ -331,6 +331,7 @@ endpoints:
   imports:
     - sqlxTypes github.com/jmoiron/sqlx/types
     - github.com/cortezaproject/corteza-server/compose/types
+    - github.com/cortezaproject/corteza-server/pkg/label
     - time
   apis:
   - name: list
@@ -357,6 +358,10 @@ endpoints:
       - type: string
         name: pageCursor
         title: Page cursor
+      - type: map[string]string
+        name: labels
+        title: Labels
+        parser: label.QueryStringToMap
       - type: string
         name: sort
         title: Sort items
@@ -382,6 +387,10 @@ endpoints:
         name: meta
         required: true
         title: Module meta data
+      - type: map[string]string
+        name: labels
+        title: Module labels
+        parser: label.QueryStringToMap
   - name: read
     method: GET
     title: Read module
@@ -423,6 +432,10 @@ endpoints:
         name: updatedAt
         required: false
         title: Last update (or creation) date
+      - type: map[string]string
+        name: labels
+        title: Module labels
+        parser: label.QueryStringToMap
   - name: delete
     method: DELETE
     title: Delete module

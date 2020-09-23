@@ -10,6 +10,7 @@ import (
 	"github.com/cortezaproject/corteza-server/pkg/eventbus"
 	"github.com/cortezaproject/corteza-server/pkg/filter"
 	"github.com/cortezaproject/corteza-server/pkg/handle"
+	"github.com/cortezaproject/corteza-server/pkg/label"
 	"github.com/cortezaproject/corteza-server/store"
 	"sort"
 	"strconv"
@@ -46,7 +47,16 @@ type (
 		DeleteByID(namespaceID, moduleID uint64) error
 	}
 
-	moduleUpdateHandler func(ctx context.Context, ns *types.Namespace, c *types.Module) (bool, bool, error)
+	moduleUpdateHandler func(ctx context.Context, ns *types.Namespace, c *types.Module) (moduleChanges, error)
+
+	moduleChanges uint
+)
+
+const (
+	moduleUnchanged     moduleChanges = 0
+	moduleChanged       moduleChanges = 1
+	moduleFieldsChanged moduleChanges = 2
+	moduleLabelsChanged moduleChanges = 4
 )
 
 func Module() ModuleService {
@@ -82,6 +92,15 @@ func (svc module) Find(filter types.ModuleFilter) (set types.ModuleSet, f types.
 	}
 
 	err = func() error {
+		if len(filter.Labels) > 0 {
+			filter.ModuleID, err = label.Search(svc.ctx, svc.store, types.ModuleLabelResourceType, filter.Labels, filter.ModuleID...)
+			if err != nil {
+				return err
+			} else if len(filter.ModuleID) == 0 {
+				return nil
+			}
+		}
+
 		if ns, err := loadNamespace(svc.ctx, svc.store, filter.NamespaceID); err != nil {
 			return err
 		} else {
@@ -89,6 +108,10 @@ func (svc module) Find(filter types.ModuleFilter) (set types.ModuleSet, f types.
 		}
 
 		if set, f, err = store.SearchComposeModules(svc.ctx, svc.store, filter); err != nil {
+			return err
+		}
+
+		if err = loadModuleLabels(svc.ctx, svc.store, set...); err != nil {
 			return err
 		}
 
@@ -212,6 +235,10 @@ func (svc module) Create(new *types.Module) (*types.Module, error) {
 			return err
 		}
 
+		if err = label.Create(ctx, s, new); err != nil {
+			return
+		}
+
 		_ = svc.eventbus.WaitFor(ctx, event.ModuleAfterCreate(new, nil, ns))
 		return nil
 	})
@@ -233,7 +260,7 @@ func (svc module) UndeleteByID(namespaceID, moduleID uint64) error {
 
 func (svc module) updater(namespaceID, moduleID uint64, action func(...*moduleActionProps) *moduleAction, fn moduleUpdateHandler) (*types.Module, error) {
 	var (
-		moduleChanged, fieldsChanged bool
+		changes moduleChanges
 
 		ns     *types.Namespace
 		m, old *types.Module
@@ -245,6 +272,10 @@ func (svc module) updater(namespaceID, moduleID uint64, action func(...*moduleAc
 		ns, m, err = loadModuleWithNamespace(svc.ctx, s, namespaceID, moduleID)
 		if err != nil {
 			return
+		}
+
+		if err = loadModuleLabels(svc.ctx, svc.store, m); err != nil {
+			return err
 		}
 
 		old = m.Clone()
@@ -262,17 +293,17 @@ func (svc module) updater(namespaceID, moduleID uint64, action func(...*moduleAc
 			return
 		}
 
-		if moduleChanged, fieldsChanged, err = fn(svc.ctx, ns, m); err != nil {
+		if changes, err = fn(svc.ctx, ns, m); err != nil {
 			return err
 		}
 
-		if moduleChanged {
+		if changes&moduleChanged > 0 {
 			if err = store.UpdateComposeModule(svc.ctx, svc.store, m); err != nil {
 				return err
 			}
 		}
 
-		if fieldsChanged {
+		if changes&moduleFieldsChanged > 0 {
 			var (
 				hasRecords bool
 				set        types.RecordSet
@@ -286,6 +317,12 @@ func (svc module) updater(namespaceID, moduleID uint64, action func(...*moduleAc
 
 			if err = updateModuleFields(ctx, s, m, m.Fields, hasRecords); err != nil {
 				return err
+			}
+		}
+
+		if changes&moduleLabelsChanged > 0 {
+			if err = label.Update(ctx, s, m); err != nil {
+				return
 			}
 		}
 
@@ -324,6 +361,10 @@ func (svc module) lookup(namespaceID uint64, lookup func(*moduleActionProps) (*t
 			return ModuleErrNotAllowedToRead()
 		}
 
+		if err = loadModuleLabels(svc.ctx, svc.store, m); err != nil {
+			return err
+		}
+
 		return loadModuleFields(svc.ctx, svc.store, m)
 
 	}()
@@ -348,79 +389,87 @@ func (svc module) uniqueCheck(m *types.Module) (err error) {
 }
 
 func (svc module) handleUpdate(upd *types.Module) moduleUpdateHandler {
-	return func(ctx context.Context, ns *types.Namespace, m *types.Module) (mch bool, fch bool, err error) {
+	return func(ctx context.Context, ns *types.Namespace, m *types.Module) (changes moduleChanges, err error) {
 		if isStale(upd.UpdatedAt, m.UpdatedAt, m.CreatedAt) {
-			return false, false, ModuleErrStaleData()
+			return moduleUnchanged, ModuleErrStaleData()
 		}
 
 		if upd.Handle != m.Handle && !handle.IsValid(upd.Handle) {
-			return false, false, ModuleErrInvalidHandle()
+			return moduleUnchanged, ModuleErrInvalidHandle()
 		}
 
 		if err = svc.uniqueCheck(upd); err != nil {
-			return false, false, err
+			return moduleUnchanged, err
 		}
 
 		if !svc.ac.CanUpdateModule(svc.ctx, m) {
-			return false, false, ModuleErrNotAllowedToUpdate()
+			return moduleUnchanged, ModuleErrNotAllowedToUpdate()
 		}
 
 		if m.Name != upd.Name {
-			mch = true
+			changes |= moduleChanged
 			m.Name = upd.Name
 		}
 
 		if m.Handle != upd.Handle {
-			mch = true
+			changes |= moduleChanged
 			m.Handle = upd.Handle
 		}
 
 		if m.Meta.String() != upd.Meta.String() {
-			mch = true
+			changes |= moduleChanged
 			m.Meta = upd.Meta
 		}
 
 		// @todo make field-change detection more optimal
 		if len(upd.Fields) > 0 {
-			fch = true
+			changes |= moduleFieldsChanged
 			m.Fields = upd.Fields
 		}
 
-		if mch {
+		if upd.Labels != nil {
+			// Labels passed, but, did anything change?
+			if label.Changed(m.Labels, upd.Labels) {
+				changes |= moduleLabelsChanged
+				m.Labels = upd.Labels
+			}
+		}
+
+		if changes&moduleChanged > 0 {
 			m.UpdatedAt = now()
 		}
 
 		// for now, we assume that
-		return mch, fch, nil
+		return changes, nil
 	}
 }
 
-func (svc module) handleDelete(ctx context.Context, ns *types.Namespace, m *types.Module) (bool, bool, error) {
+func (svc module) handleDelete(ctx context.Context, ns *types.Namespace, m *types.Module) (moduleChanges, error) {
 	if !svc.ac.CanDeleteModule(ctx, m) {
-		return false, false, ModuleErrNotAllowedToDelete()
+		return moduleUnchanged, ModuleErrNotAllowedToDelete()
 	}
 
 	if m.DeletedAt != nil {
 		// module already deleted
-		return false, false, nil
+		return moduleUnchanged, nil
 	}
 
 	m.DeletedAt = now()
-	return true, false, nil
+	return moduleChanged, nil
 }
 
-func (svc module) handleUndelete(ctx context.Context, ns *types.Namespace, m *types.Module) (bool, bool, error) {
+func (svc module) handleUndelete(ctx context.Context, ns *types.Namespace, m *types.Module) (moduleChanges, error) {
 	if !svc.ac.CanDeleteModule(ctx, m) {
-		return false, false, ModuleErrNotAllowedToUndelete()
+		return moduleUnchanged, ModuleErrNotAllowedToUndelete()
 	}
 
 	if m.DeletedAt == nil {
 		// module not deleted
-		return false, false, nil
+		return moduleUnchanged, nil
 	}
 
 	m.DeletedAt = nil
-	return true, false, nil
+	return moduleChanged, nil
 }
 
 // updates module fields
@@ -486,6 +535,22 @@ func updateModuleFields(ctx context.Context, s store.Storer, m *types.Module, ne
 	}
 
 	return nil
+}
+
+// loads labels on all modules
+//
+// A dedicated function is needed because of conversion to label.LabeledResource interface
+func loadModuleLabels(ctx context.Context, s store.Storer, mm ...*types.Module) (err error) {
+	if len(mm) == 0 {
+		return nil
+	}
+
+	ll := make([]label.LabeledResource, len(mm))
+	for i := range mm {
+		ll[i] = mm[i]
+	}
+
+	return label.Load(ctx, s, ll...)
 }
 
 func loadModuleFields(ctx context.Context, s store.Storer, mm ...*types.Module) (err error) {

@@ -12,6 +12,10 @@ func (s Store) convertComposeModuleFilter(f types.ModuleFilter) (query squirrel.
 
 	query = filter.StateCondition(query, "cmd.deleted_at", f.Deleted)
 
+	if len(f.ModuleID) > 0 {
+		query = query.Where(squirrel.Eq{"cmd.id": f.ModuleID})
+	}
+
 	if f.NamespaceID > 0 {
 		query = query.Where("cmd.rel_namespace = ?", f.NamespaceID)
 	}

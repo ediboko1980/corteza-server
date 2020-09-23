@@ -95,3 +95,11 @@ func ParseInt64(s string) int64 {
 func ParseBool(s string) bool {
 	return truthy.MatchString(strings.ToLower(s))
 }
+
+func UnmarshalQueryParam(v interface{}, s []string) (bool, error) {
+	if v, ok := v.(interface{ UnmarshalQueryParam([]string) error }); !ok {
+		return true, v.UnmarshalQueryParam(s)
+	}
+
+	return false, nil
+}

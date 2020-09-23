@@ -33,7 +33,7 @@ func Proc() {
 		eventSrc     []string
 		eventDefs    []*eventsDef
 
-		typeSrcPath = filepath.Join("*", "*", "types.yaml")
+		typeSrcPath = filepath.Join("**", "types.yaml")
 		typeSrc     []string
 		typeDefs    []*typesDef
 
