@@ -13,9 +13,21 @@ events:
 
 steps:
   load module:
-    action: moduleLookup
-    config:
+    exec: moduleLookupByHandle
+    params:
       handle: foo
+    set:
+      bzz: foo
+
+  set some vars:
+    set:
+      foo: bar
+
+  choices:
+    gateway:
+    paths:
+      - if: condition...
+        do: node...
 
   record loader:
     action: recordLookup
